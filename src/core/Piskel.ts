@@ -12,7 +12,15 @@
  */
 
 import { Frame } from './Frame.js';
-import { Layer } from './Layer.js';
+import { Layer, LayerData } from './Layer.js';
+
+export interface PiskelData {
+  width: number;
+  height: number;
+  fps: number;
+  descriptor: { name: string; description?: string };
+  layers: LayerData[];
+}
 
 export interface PiskelDescriptor {
   name: string;
@@ -45,6 +53,17 @@ export class Piskel {
     this.layers = [];
     this.savePath = null;
     this.hiddenFrames = [];
+  }
+
+  /**
+   * Reconstruct a Piskel from serialized PiskelData.
+   */
+  static fromJSON(data: PiskelData): Piskel {
+    const piskel = new Piskel(data.width, data.height, data.fps ?? 1, data.descriptor);
+    for (const layerData of data.layers) {
+      piskel.addLayer(Layer.fromJSON(layerData, data.width, data.height));
+    }
+    return piskel;
   }
 
   /**
@@ -238,6 +257,7 @@ export class Piskel {
       layers: this.layers.map(layer => ({
         name: layer.getName(),
         opacity: layer.getOpacity(),
+        visible: layer.isVisible(),
         frames: layer.getFrames().map(frame => frame.toArray()),
       })),
     };
