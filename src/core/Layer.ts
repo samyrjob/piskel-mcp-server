@@ -12,6 +12,13 @@
 
 import { Frame } from './Frame.js';
 
+export interface LayerData {
+  name: string;
+  opacity?: number;
+  visible?: boolean;
+  frames: number[][][];
+}
+
 /**
  * Layer represents a collection of frames at the same z-index.
  */
@@ -37,6 +44,26 @@ export class Layer {
   static fromFrames(name: string, frames: Frame[]): Layer {
     const layer = new Layer(name);
     frames.forEach(frame => layer.addFrame(frame));
+    return layer;
+  }
+
+  /**
+   * Reconstruct a Layer from serialized LayerData.
+   */
+  static fromJSON(data: LayerData, frameWidth: number, frameHeight: number): Layer {
+    const layer = new Layer(data.name);
+    if (data.opacity !== undefined) layer.setOpacity(data.opacity);
+    if (data.visible !== undefined) layer.setVisible(data.visible);
+    for (const frameData of data.frames) {
+      const flat = new Uint32Array(frameWidth * frameHeight);
+      for (let y = 0; y < frameHeight; y++) {
+        const row = frameData[y];
+        for (let x = 0; x < frameWidth; x++) {
+          flat[y * frameWidth + x] = row[x];
+        }
+      }
+      layer.addFrame(Frame.fromPixelGrid(flat, frameWidth, frameHeight));
+    }
     return layer;
   }
 
