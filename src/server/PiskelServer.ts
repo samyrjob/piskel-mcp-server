@@ -1362,12 +1362,16 @@ export class PiskelServer {
                   },
                   colorMap: {
                     type: 'object',
-                    description: 'Mapping of source color to replacement color in hex, e.g. {"#a02c2c": "#2c7a2c"}. Matching is exact on RGB; the pixel\'s original alpha is kept.',
+                    description: 'Mapping of source color to replacement color in hex, e.g. {"#a02c2c": "#2c7a2c"}. The pixel\'s original alpha is kept.',
                     additionalProperties: { type: 'string' },
                   },
                 },
                 required: ['name', 'colorMap'],
               },
+            },
+            tolerance: {
+              type: 'number',
+              description: 'Max Euclidean RGB distance (0-441) for a pixel to match a source color; the nearest source color wins. 0 (default) = exact match only. When > 0, matched pixels keep their shading: they are shifted by (target - source), not flattened to the target color. Typical value for anti-aliased sprites: 60-90.',
             },
             recursive: {
               type: 'boolean',
@@ -1796,7 +1800,8 @@ export class PiskelServer {
           args.outputRoot as string,
           args.variants as Array<{ name: string; colorMap: Record<string, string> }>,
           (args.recursive as boolean) ?? false,
-          (args.exclude as string[]) ?? []
+          (args.exclude as string[]) ?? [],
+          (args.tolerance as number) ?? 0
         );
 
       default:
@@ -3180,7 +3185,8 @@ export class PiskelServer {
     outputRoot: string,
     variants: Array<{ name: string; colorMap: Record<string, string> }>,
     recursive: boolean,
-    exclude: string[]
+    exclude: string[],
+    tolerance: number
   ): object {
     if (!fs.existsSync(inputFolder)) {
       throw new Error(`Input folder not found: ${inputFolder}`);
@@ -3210,6 +3216,10 @@ export class PiskelServer {
       throw new Error(`No PNG files found in: ${inputFolder}`);
     }
 
+    if (tolerance < 0 || tolerance > 442) {
+      throw new Error(`tolerance must be between 0 and 441, got: ${tolerance}`);
+    }
+
     // Pre-parse and validate all variants before writing anything
     const parsedVariants = variants.map((v) => {
       if (!v.name || /[\\/:*?"<>|]/.test(v.name)) {
@@ -3226,9 +3236,14 @@ export class PiskelServer {
         if (!to) throw new Error(`Variant "${v.name}": invalid replacement color "${newColor}"`);
         map.set((from.r << 16) | (from.g << 8) | from.b, { r: to.r, g: to.g, b: to.b });
       }
-      return { name: v.name, map };
+      // Signature identifies the source-color set, so variants sharing a palette
+      // can share the per-file pixel->source assignment cache.
+      const sourceKeys = [...map.keys()].sort((a, b) => a - b);
+      return { name: v.name, map, sourceKeys, signature: sourceKeys.join(',') };
     });
 
+    const tolSq = tolerance * tolerance;
+    const clamp = (v: number): number => (v < 0 ? 0 : v > 255 ? 255 : v);
     const matchedKeys = new Set<number>();
     let filesWritten = 0;
     let totalPixelsChanged = 0;
@@ -3237,22 +3252,54 @@ export class PiskelServer {
       const png = PNG.sync.read(fs.readFileSync(path.join(inputFolder, relFile)));
       const { width, height, data } = png;
 
+      // Per source-color-set: map each RGB value in this file to its matched
+      // source color (or -1), computed once and reused by every variant.
+      const assignmentCache = new Map<string, Map<number, number>>();
+      const getAssignments = (signature: string, sourceKeys: number[]): Map<number, number> => {
+        let assignments = assignmentCache.get(signature);
+        if (assignments) return assignments;
+        assignments = new Map<number, number>();
+        for (let i = 0; i < data.length; i += 4) {
+          if (data[i + 3] === 0) continue;
+          const key = (data[i] << 16) | (data[i + 1] << 8) | data[i + 2];
+          if (assignments.has(key)) continue;
+          let best = -1;
+          let bestDist = tolSq + 1;
+          for (const src of sourceKeys) {
+            const dr = data[i] - ((src >> 16) & 0xff);
+            const dg = data[i + 1] - ((src >> 8) & 0xff);
+            const db = data[i + 2] - (src & 0xff);
+            const dist = dr * dr + dg * dg + db * db;
+            if (dist < bestDist) {
+              bestDist = dist;
+              best = src;
+            }
+          }
+          assignments.set(key, best);
+        }
+        assignmentCache.set(signature, assignments);
+        return assignments;
+      };
+
       for (const variant of parsedVariants) {
+        const assignments = getAssignments(variant.signature, variant.sourceKeys);
         const outData = Buffer.from(data);
         let pixelsChanged = 0;
 
         for (let i = 0; i < outData.length; i += 4) {
           if (outData[i + 3] === 0) continue;
           const key = (outData[i] << 16) | (outData[i + 1] << 8) | outData[i + 2];
-          const repl = variant.map.get(key);
-          if (repl) {
-            outData[i] = repl.r;
-            outData[i + 1] = repl.g;
-            outData[i + 2] = repl.b;
-            // alpha unchanged
-            matchedKeys.add(key);
-            pixelsChanged++;
-          }
+          const srcKey = assignments.get(key) ?? -1;
+          if (srcKey === -1) continue;
+          const target = variant.map.get(srcKey)!;
+          // Shift by (target - source) so shading and anti-aliasing survive;
+          // for an exact match (tolerance 0) this equals plain replacement.
+          outData[i] = clamp(outData[i] - ((srcKey >> 16) & 0xff) + target.r);
+          outData[i + 1] = clamp(outData[i + 1] - ((srcKey >> 8) & 0xff) + target.g);
+          outData[i + 2] = clamp(outData[i + 2] - (srcKey & 0xff) + target.b);
+          // alpha unchanged
+          matchedKeys.add(srcKey);
+          pixelsChanged++;
         }
 
         const outPath = path.join(outputRoot, variant.name, relFile);
