@@ -30,6 +30,15 @@ import { Piskel } from '../core/Piskel.js';
 import { Palette, getPresetPalette, listPresetPalettes } from '../core/Palette.js';
 import { intToHex, colorToInt, parseColor, rgbToHex } from '../core/color.js';
 import {
+  resolveDataDir,
+  ensureDataDir,
+  loadAllProjects,
+  saveProject,
+  deleteProjectFile,
+  loadPalettes,
+  savePalettesToDisk,
+} from './PiskelStore.js';
+import {
   drawPixel,
   drawLine,
   drawRectangle,
@@ -62,10 +71,19 @@ import {
  */
 export class PiskelServer {
   private server: Server;
-  private projects: Map<string, Piskel> = new Map();
-  private palettes: Map<string, Palette> = new Map();
+  private projects: Map<string, Piskel>;
+  private palettes: Map<string, Palette>;
+  private dataDir: string;
+  private saveTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
 
-  constructor() {
+  constructor(dataDir?: string) {
+    this.dataDir = resolveDataDir(dataDir);
+    ensureDataDir(this.dataDir);
+    this.projects = loadAllProjects(this.dataDir);
+    this.palettes = loadPalettes(this.dataDir);
+
+    process.on('beforeExit', () => this.flushAllSaves());
+
     this.server = new Server(
       {
         name: 'piskel-mcp-server',
@@ -1829,6 +1847,7 @@ export class PiskelServer {
     piskel.addLayer(defaultLayer);
 
     this.projects.set(projectId, piskel);
+    this.scheduleSave(projectId);
 
     return {
       success: true,
@@ -1880,6 +1899,10 @@ export class PiskelServer {
       throw new Error(`Project "${projectId}" not found`);
     }
     this.projects.delete(projectId);
+    const timer = this.saveTimers.get(projectId);
+    if (timer) clearTimeout(timer);
+    this.saveTimers.delete(projectId);
+    deleteProjectFile(this.dataDir, projectId);
     return { success: true, projectId };
   }
 
@@ -1896,6 +1919,7 @@ export class PiskelServer {
     }
 
     piskel.addLayer(layer);
+    this.scheduleSave(projectId);
 
     return {
       success: true,
@@ -1912,6 +1936,7 @@ export class PiskelServer {
     }
 
     piskel.removeLayer(layer);
+    this.scheduleSave(projectId);
     return { success: true, layerIndex };
   }
 
@@ -1927,6 +1952,7 @@ export class PiskelServer {
       }
     }
 
+    this.scheduleSave(projectId);
     return {
       success: true,
       frameIndex: piskel.getFrameCount() - 1,
@@ -1948,6 +1974,7 @@ export class PiskelServer {
       }
     }
 
+    this.scheduleSave(projectId);
     return { success: true, frameIndex };
   }
 
@@ -1969,6 +1996,7 @@ export class PiskelServer {
       }
     }
 
+    this.scheduleSave(projectId);
     return {
       success: true,
       sourceFrameIndex: frameIndex,
@@ -1987,6 +2015,7 @@ export class PiskelServer {
   ): object {
     const frame = this.getFrame(projectId, layerIndex, frameIndex);
     const success = drawPixel(frame, x, y, color);
+    this.scheduleSave(projectId);
     return { success, x, y, color };
   }
 
@@ -2011,6 +2040,7 @@ export class PiskelServer {
       }
     }
 
+    this.scheduleSave(projectId);
     return { success: true, pixelsDrawn: count };
   }
 
@@ -2027,6 +2057,7 @@ export class PiskelServer {
   ): object {
     const frame = this.getFrame(projectId, layerIndex, frameIndex);
     const count = drawLine(frame, x0, y0, x1, y1, color, penSize);
+    this.scheduleSave(projectId);
     return { success: true, pixelsDrawn: count };
   }
 
@@ -2046,6 +2077,7 @@ export class PiskelServer {
     const count = filled
       ? drawFilledRectangle(frame, x0, y0, x1, y1, color)
       : drawRectangle(frame, x0, y0, x1, y1, color, penSize);
+    this.scheduleSave(projectId);
     return { success: true, pixelsDrawn: count };
   }
 
@@ -2088,6 +2120,7 @@ export class PiskelServer {
     const count = filled
       ? drawFilledCircle(frame, bx0, by0, bx1, by1, color)
       : drawCircle(frame, bx0, by0, bx1, by1, color, penSize);
+    this.scheduleSave(projectId);
     return { success: true, pixelsDrawn: count };
   }
 
@@ -2101,6 +2134,7 @@ export class PiskelServer {
   ): object {
     const frame = this.getFrame(projectId, layerIndex, frameIndex);
     const count = fillArea(frame, x, y, color);
+    this.scheduleSave(projectId);
     return { success: true, pixelsFilled: count };
   }
 
@@ -2114,6 +2148,7 @@ export class PiskelServer {
   ): object {
     const frame = this.getFrame(projectId, layerIndex, frameIndex);
     const count = erasePixel(frame, x, y, penSize);
+    this.scheduleSave(projectId);
     return { success: true, pixelsErased: count };
   }
 
@@ -2177,7 +2212,7 @@ export class PiskelServer {
     const frame = this.getFrame(projectId, layerIndex, frameIndex);
 
     frame.clear();
-
+    this.scheduleSave(projectId);
     return { success: true, pixelsCleared: piskel.getWidth() * piskel.getHeight() };
   }
 
@@ -2285,6 +2320,36 @@ export class PiskelServer {
     return frame;
   }
 
+  // Persistence helpers
+  private scheduleSave(key: string): void {
+    const existing = this.saveTimers.get(key);
+    if (existing) clearTimeout(existing);
+    this.saveTimers.set(key, setTimeout(() => {
+      this.saveTimers.delete(key);
+      this.flushSave(key);
+    }, 200));
+  }
+
+  private flushSave(key: string): void {
+    if (key === '__palettes__') {
+      savePalettesToDisk(this.dataDir, this.palettes);
+    } else {
+      const piskel = this.projects.get(key);
+      if (piskel) {
+        saveProject(this.dataDir, key, piskel);
+      }
+    }
+  }
+
+  private flushAllSaves(): void {
+    for (const [key] of this.saveTimers) {
+      const timer = this.saveTimers.get(key);
+      if (timer) clearTimeout(timer);
+      this.flushSave(key);
+    }
+    this.saveTimers.clear();
+  }
+
   // Color tool implementations
   private replaceColorTool(
     projectId: string,
@@ -2319,6 +2384,7 @@ export class PiskelServer {
       totalCount = replaceColor(frame, oldColor, newColor);
     }
 
+    this.scheduleSave(projectId);
     return { success: true, pixelsChanged: totalCount, oldColor, newColor, allFrames, allLayers };
   }
 
@@ -2355,6 +2421,7 @@ export class PiskelServer {
       totalCount = swapColors(frame, colorA, colorB);
     }
 
+    this.scheduleSave(projectId);
     return { success: true, pixelsChanged: totalCount, colorA, colorB, allFrames, allLayers };
   }
 
@@ -2382,6 +2449,7 @@ export class PiskelServer {
       }
     }
 
+    this.scheduleSave(projectId);
     return { success: true, transform: 'flip_horizontal', framesProcessed };
   }
 
@@ -2408,6 +2476,7 @@ export class PiskelServer {
       }
     }
 
+    this.scheduleSave(projectId);
     return { success: true, transform: 'flip_vertical', framesProcessed };
   }
 
@@ -2455,6 +2524,7 @@ export class PiskelServer {
       framesProcessed++;
     }
 
+    this.scheduleSave(projectId);
     return { success: true, transform: 'rotate', angle, framesProcessed };
   }
 
@@ -2484,6 +2554,7 @@ export class PiskelServer {
       }
     }
 
+    this.scheduleSave(projectId);
     return { success: true, transform: 'shift', dx, dy, wrap, framesProcessed };
   }
 
@@ -2509,6 +2580,7 @@ export class PiskelServer {
       }
     }
 
+    this.scheduleSave(projectId);
     return { success: true, fromIndex, toIndex };
   }
 
@@ -2533,6 +2605,7 @@ export class PiskelServer {
       }
     }
 
+    this.scheduleSave(projectId);
     return { success: true, frameIndexA, frameIndexB };
   }
 
@@ -2549,6 +2622,7 @@ export class PiskelServer {
     }
     const oldName = layer.getName();
     layer.setName(name);
+    this.scheduleSave(projectId);
     return { success: true, layerIndex, oldName, newName: name };
   }
 
@@ -2563,6 +2637,7 @@ export class PiskelServer {
       throw new Error(`Layer ${layerIndex} not found`);
     }
     layer.setOpacity(opacity);
+    this.scheduleSave(projectId);
     return { success: true, layerIndex, opacity: layer.getOpacity() };
   }
 
@@ -2577,6 +2652,7 @@ export class PiskelServer {
       throw new Error(`Layer ${layerIndex} not found`);
     }
     layer.setVisible(visible);
+    this.scheduleSave(projectId);
     return { success: true, layerIndex, visible };
   }
 
@@ -2617,6 +2693,7 @@ export class PiskelServer {
     }
 
     piskel.removeLayer(sourceLayer);
+    this.scheduleSave(projectId);
 
     return {
       success: true,
@@ -2641,6 +2718,7 @@ export class PiskelServer {
         );
       }
       this.palettes.set(paletteId, presetPalette);
+      this.scheduleSave('__palettes__');
       return {
         success: true,
         paletteId,
@@ -2652,6 +2730,7 @@ export class PiskelServer {
 
     const palette = new Palette(name ?? paletteId, colors ?? []);
     this.palettes.set(paletteId, palette);
+    this.scheduleSave('__palettes__');
 
     return {
       success: true,
@@ -2696,6 +2775,7 @@ export class PiskelServer {
       throw new Error(`Palette "${paletteId}" not found`);
     }
     palette.addColor(color);
+    this.scheduleSave('__palettes__');
     return {
       success: true,
       paletteId,
@@ -2710,6 +2790,7 @@ export class PiskelServer {
       throw new Error(`Palette "${paletteId}" not found`);
     }
     palette.removeColor(color);
+    this.scheduleSave('__palettes__');
     return {
       success: true,
       paletteId,
@@ -2817,6 +2898,7 @@ export class PiskelServer {
     }
 
     this.projects.set(projectId, newPiskel);
+    this.scheduleSave(projectId);
 
     return {
       success: true,
@@ -2867,6 +2949,7 @@ export class PiskelServer {
       }
     }
 
+    this.scheduleSave(projectId);
     return {
       success: true,
       pixelsCopied,
@@ -2950,6 +3033,7 @@ export class PiskelServer {
     const piskel = this.getProject(projectId);
     const oldFps = piskel.getFPS();
     piskel.setFPS(fps);
+    this.scheduleSave(projectId);
 
     return {
       success: true,
@@ -3038,6 +3122,7 @@ export class PiskelServer {
     }
 
     const sizeMismatch = imgWidth !== projectWidth || imgHeight !== projectHeight;
+    this.scheduleSave(projectId);
     return {
       success: true,
       projectId,
